@@ -1,3 +1,4 @@
 preprocess/
 data/
 venv/
+__pycache__/

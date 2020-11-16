@@ -58,7 +58,9 @@ def get_train_val_test_loader(dataset, train_dirs, val_dirs, test_dirs, collate_
 		test_loader     = DataLoader(dataset, batch_size=batch_size, sampler=test_sampler, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
 		return train_loader, val_loader, test_loader
 	else:
-		test_indices    = [i for i, row in enumerate(dataset.id_prop_data) if row[0].split('_')[0] in test_dirs]
+		test_indices    = [i for i, row in enumerate(dataset.id_prop_data)] #SEE NOTE BELOW
+                #TODO: this ia temporary hack to get a loader out of their data for a quick hack -ABDG 20201115
+                #test_indices    = [i for i, row in enumerate(dataset.id_prop_data)]
 		random.shuffle(test_indices)
 		test_sampler    = SubsetRandomSampler(test_indices)
 		test_loader     = DataLoader(dataset, batch_size=batch_size, sampler=test_sampler, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
