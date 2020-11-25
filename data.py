@@ -105,6 +105,52 @@ def collate_pool(dataset_list):
 			(batch_protein_ids, np.concatenate(batch_amino_crystal)), (final_target, torch.cat(final_amino_target))
 
 
+def collate_pool_docking(dataset_list):
+	N   = max([x[0][0].size(0) for x in dataset_list])  # max atoms
+	M   = dataset_list[0][0][1].size(1)                 # num neighbors are same for all so take the first value
+	B   = len(dataset_list)                             # Batch size
+	h_b = dataset_list[0][0][1].size(2)                 # Edge feature length
+
+	final_protein_atom_fea = torch.zeros(B, N)
+	final_nbr_fea          = torch.zeros(B, N, M, h_b)
+	final_nbr_fea_idx      = torch.zeros(B, N, M, dtype=torch.long)
+	final_atom_amino_idx   = torch.zeros(B, N)
+	final_atom_mask        = torch.zeros(B, N)
+	final_target           = torch.zeros(B, 1)
+	amino_base_idx         = 0
+
+	batch_protein_ids, batch_amino_crystal, amino_crystal = [], [], 0
+	for i, (ligand_information, receptor_information, adjacencies) in enumerate(dataset_list):
+		#unpack the Ligand informatino from the dataset
+		(protein_atom_fea, nbr_fea, nbr_fea_idx, atom_amino_idx), (target, amino_target), protein_id = ligand_information
+		num_nodes                             = protein_atom_fea.size(0)
+		final_protein_atom_fea[i][:num_nodes] = protein_atom_fea.squeeze()
+		final_nbr_fea[i][:num_nodes]          = nbr_fea
+		final_nbr_fea_idx[i][:num_nodes]      = nbr_fea_idx
+		final_atom_amino_idx[i][:num_nodes]   = atom_amino_idx + amino_base_idx
+		final_atom_amino_idx[i][num_nodes:]   = amino_base_idx
+		#Concerning to me that they increment their amino base_idx. WE don't want this
+		# amino_base_idx                       += torch.max(atom_amino_idx) + 1
+		final_atom_mask[i][:num_nodes]        = 1
+		ligand_return = (final_protein_atom_fea, final_nbr_fea, final_nbr_fea_idx, None, final_atom_amino_idx, final_atom_mask)
+
+		#Unpack the Receptor information from the daast
+		(protein_atom_fea, nbr_fea, nbr_fea_idx, atom_amino_idx), (target, amino_target), protein_id = receptor_information
+		num_nodes = protein_atom_fea.size(0)
+		final_protein_atom_fea[i][:num_nodes] = protein_atom_fea.squeeze()
+		final_nbr_fea[i][:num_nodes] = nbr_fea
+		final_nbr_fea_idx[i][:num_nodes] = nbr_fea_idx
+		final_atom_amino_idx[i][:num_nodes] = atom_amino_idx + amino_base_idx
+		final_atom_amino_idx[i][num_nodes:] = amino_base_idx
+		# Concerning to me that they increment their amino base_idx. WE don't want this
+		# amino_base_idx                       += torch.max(atom_amino_idx) + 1
+		final_atom_mask[i][:num_nodes] = 1
+		receptor_return = ( final_protein_atom_fea, final_nbr_fea, final_nbr_fea_idx, None, final_atom_amino_idx, final_atom_mask)
+
+	return ligand_return, receptor_return, adjacencies
+
+
+
 class GaussianDistance(object):
 	"""
 	Expands the distance by Gaussian basis.
@@ -193,6 +239,114 @@ class AtomCustomJSONInitializer(AtomInitializer):
 		counter = 0
 		for key, _ in elem_embedding.items():
 			self._embedding[key] = counter; counter += 1
+
+
+class ProteinDockingDataset(Dataset):
+	#Exactly like the orginal ProteinDataset but now it returns an additional dimension for ligand/receptor
+	#Hardcoded for DB5 loading
+	def __init__(self, pkl_dir, pdb_dir, id_prop_filename,chooseBound, atom_init_filename,):
+		assert os.path.exists(pkl_dir), '{} does not exist!'.format(pkl_dir)
+
+		self.pkl_dir = pkl_dir
+		self.pdb_dir = pdb_dir
+		self.chooseBound = chooseBound
+
+		id_prop_file = os.path.join(self.pkl_dir, id_prop_filename)
+		assert os.path.exists(id_prop_file), '{} does not exist!'.format(id_prop_file)
+
+		with open(id_prop_file) as f:
+			reader = csv.reader(f)
+			self.id_prop_data = [row for row in reader]
+
+		#Get the pdbs from the prop file
+		# Sample filename: CP57_CP57_l_b_cleane.pkl
+		self.pdbs = [pklname.split('_')[0] for pklname in self.id_prop_data]
+		self.isligand = [pklname.split('_')[2]=='l' for pklname in self.id_prop_data]
+		self.isbound = [pklname.split('_')[3] == 'b' for pklname in self.id_prop_data]
+		# random.seed(random_seed)
+		# random.shuffle(self.id_prop_data)
+
+		protein_atom_init_file  = os.path.join(self.pkl_dir, atom_init_filename)
+		assert os.path.exists(protein_atom_init_file), '{} does not exist!'.format(protein_atom_init_file)
+		self.ari                = AtomCustomJSONInitializer(protein_atom_init_file)
+		self.gdf                = GaussianDistance(dmin=0, dmax=15, step=0.4)
+
+	def __len__(self):
+		return len(np.unique(self.pdbs))
+
+	def __getitem__(self, idx):
+		return self.get_idx(idx)
+
+	# Loads an adjacency graph in atoms, must convert to residues
+	def loadAdjacencyMatrix(self,pdb):
+		#DB5 specific
+		boundchar = 'b'
+		if not self.chooseBound:
+			boundchar = 'u'
+		file = np.load(os.path.join(self.pdb_dir, pdb, f'{pdb}_{boundchar}_adjacencies.npy'))
+		#[(500, 64, 'A'), (1116, 141), 'A'],
+		adjacencies_full = np.load(file)
+		#Return just amino acids, which is the
+		adjacencies_short = [[a[0][1], a[1][1]] for a in adjacencies_full]
+		return adjacencies_short
+
+	def get_idx(self, idx):
+		pdb = np.unique(self.pdbs)[idx]
+		pdb_indices = [i for i, s in enumerate(self.pdbs) if pdb in s]
+		#Get the ligand and receptor
+		for p_idx in pdb_indices:
+			if self.isligand[p_idx] and self.isbound[p_idx]==self.chooseBound:
+				index_ligand = p_idx
+			elif ~self.isligand[p_idx] and self.isbound[p_idx]==self.chooseBound:
+				index_receptor = p_idx
+
+		filename_ligand,_,_= self.id_prop_data[index_ligand]
+		filename_receptor,_,_ = self.id_prop_data[index_receptor]
+		print(f"Loading: {self.pkl_dir + filename_ligand + '.pkl'}")
+		with open(self.pkl_dir + filename_ligand + '.pkl', 'rb') as f:
+			protein_atom_fea    = torch.Tensor(np.vstack([self.ari.get_atom_fea(atom) for atom in pickle.load(f)]))     # Atom features (here one-hot encoding is used)
+			nbr_info            = pickle.load(f)                                                                        # Edge features for each atom in the graph
+			nbr_fea_idx         = torch.LongTensor(pickle.load(f))                                                      # Edge connections that define the graph
+
+			atom_amino_idx  = torch.LongTensor(pickle.load(f))  # Mapping that denotes which atom corresponds to which amino residue in the protein graph
+
+			# if not amino_target[0]<0:
+			# 	assert len(amino_target) == atom_amino_idx[-1] + 1  # (useful for calculating the amino level lddt score)
+			# 	target = torch.Tensor([float(target)])  # Global gdt score
+			# 	amino_target = torch.Tensor(amino_target)  # Amino level lddt score
+			# else:
+			# 	#When we don't have a specified target, just return -1s
+			# 	target = torch.Tensor([float(-1)])  # Global gdt score
+			# 	amino_target = torch.Tensor(amino_target)  # Amino level lddt score
+
+			protein_id          = pickle.load(f)
+			nbr_fea             = torch.Tensor(np.concatenate([self.gdf.expand(nbr_info[:,:,0]), nbr_info[:,:,1:]], axis=2))    # Use Gaussian expansion for edge distance
+
+		ligand_return = (protein_atom_fea, nbr_fea, nbr_fea_idx, atom_amino_idx), (None, None), protein_id
+
+		with open(self.pkl_dir + filename_receptor + '.pkl', 'rb') as f:
+			protein_atom_fea    = torch.Tensor(np.vstack([self.ari.get_atom_fea(atom) for atom in pickle.load(f)]))     # Atom features (here one-hot encoding is used)
+			nbr_info            = pickle.load(f)                                                                        # Edge features for each atom in the graph
+			nbr_fea_idx         = torch.LongTensor(pickle.load(f))                                                      # Edge connections that define the graph
+
+			atom_amino_idx  = torch.LongTensor(pickle.load(f))  # Mapping that denotes which atom corresponds to which amino residue in the protein graph
+
+			if not amino_target[0]<0:
+				assert len(amino_target) == atom_amino_idx[-1] + 1  # (useful for calculating the amino level lddt score)
+				target = torch.Tensor([float(target)])  # Global gdt score
+				amino_target = torch.Tensor(amino_target)  # Amino level lddt score
+			else:
+				#When we don't have a specified target, just return -1s
+				target = torch.Tensor([float(target)])  # Global gdt score
+				amino_target = torch.Tensor(amino_target)  # Amino level lddt score
+
+			protein_id          = pickle.load(f)
+			nbr_fea             = torch.Tensor(np.concatenate([self.gdf.expand(nbr_info[:,:,0]), nbr_info[:,:,1:]], axis=2))    # Use Gaussian expansion for edge distance
+
+		receptor_return = (protein_atom_fea, nbr_fea, nbr_fea_idx, atom_amino_idx), (target, amino_target), protein_id
+
+		adjacencies = self.loadAdjacencyMatrix(pdb)
+		return [ligand_return,receptor_return,adjacencies]
 
 
 class ProteinDataset(Dataset):
@@ -288,5 +442,5 @@ class ProteinDataset(Dataset):
 			protein_id          = pickle.load(f)
 			nbr_fea             = torch.Tensor(np.concatenate([self.gdf.expand(nbr_info[:,:,0]), nbr_info[:,:,1:]], axis=2))    # Use Gaussian expansion for edge distance
 
-
+		#Into the model goes [inputs[0], inputs[1], inputs[2], inputs[4], inputs[5]]
 		return (protein_atom_fea, nbr_fea, nbr_fea_idx, atom_amino_idx), (target, amino_target), protein_id
